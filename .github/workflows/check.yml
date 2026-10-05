@@ -1,0 +1,22 @@
+name: Check scripts
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check shell syntax
+        run: bash -n deploy-xray.sh upgrade-xray.sh
+      - name: Check manager syntax
+        run: python3 -c "import ast, pathlib; ast.parse(pathlib.Path('manager.py').read_text())"
+      - name: Test isolated upgrade and rollback
+        run: python3 -m unittest discover -s tests -v

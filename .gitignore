@@ -1,0 +1,27 @@
+测试用服务器ssh.md
+__pycache__/
+
+# Local deployment notes and workspace settings
+local/
+.agents/
+.codex/
+.aws/
+/AGENTS.md
+
+# Credentials and generated server state
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+config.json
+config-*.json
+connection.json
+*.sqlite3*
+*.db
+*.log
+xray-backup-*/
+upgrade-*/
+*.zip
+*.tar.gz
