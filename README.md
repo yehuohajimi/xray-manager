@@ -2,6 +2,8 @@
 
 面向 Debian/Ubuntu VPS 的 Xray 安装与管理脚本，使用 VLESS + REALITY + Vision，提供设备账号、流量统计和来源 IP 历史查询，以及保留现有账号和配置的原地升级。
 
+项目运行结构以及配置、日志、统计库和备份的具体位置，见 [结构与文件路径说明](xray-README.md)。
+
 ## 运行要求与默认配置
 
 - 在目标 VPS 上以 root 执行，系统使用 systemd；支持 x86_64 和 aarch64。
