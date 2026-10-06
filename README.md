@@ -92,12 +92,35 @@ xray-manager share device-1
 
 链接包含代理访问凭据，请勿公开分享。
 
+## CLI 交互菜单
+
+SSH 登录 VPS 后，在终端中直接运行：
+
+```bash
+xray-manager
+# 或显式打开菜单
+xray-manager menu
+```
+
+输入数字并按回车选择操作。菜单提供服务状态、设备列表、新增/撤销设备、客户端分享链接、累计或最近 1–90 天流量、当前 TCP 连接、历史来源 IP、服务启停、最近 100 条服务日志和手动采集。设备列表只显示账号名，分享链接可选择单个或全部设备。
+
+新增/撤销设备、重启和停服会提示连接影响并要求确认，默认取消。操作完成或失败后按回车返回菜单；输入 `0` 或 `q` 退出，Ctrl+C 或输入结束也可退出。
+
+菜单等待选择、输入参数、确认和返回期间不持有 `manager.lock`，也不保持统计数据库连接，因此不会阻塞后台每分钟采集或其他管理命令。实际采集和配置修改仍使用独占锁，增删设备的读取、校验、保存及重启在同一次锁定内完成；失败或退出时释放锁与数据库连接。
+
+原有子命令保持可用，脚本和定时任务继续使用 `xray-manager collect`、`xray-manager stats` 等命令。非交互环境中不带参数只输出帮助，显式 `menu` 会报错，不会等待输入。帮助无需安装运行数据即可查看：`python3 manager.py help`。
+
+已有安装在更新仓库后执行 `bash upgrade-xray.sh`，即可更新菜单功能，无需重装或设置 `VERSION`，只更新管理程序不会重启 Xray。
+
 ## 每台设备独立账号
 
 ```bash
 # 创建账号并立即输出导入链接
 xray-manager add-device iphone
 xray-manager add-device windows
+
+# 只列出设备账号名
+xray-manager list-devices
 
 # 查看某个账号，或所有账号的导入链接
 xray-manager share iphone
@@ -184,7 +207,10 @@ xray-manager restart
 xray-manager stop
 
 # 启动已停止的服务
-systemctl start xray
+xray-manager start
+
+# 最近 100 条服务日志
+xray-manager logs
 
 # 开机自启
 systemctl enable xray xray-stats.timer
@@ -248,7 +274,7 @@ chmod 600 /root/xray-config-backup.tar.gz
 - `deploy-xray.sh`：首次安装和显式重装。
 - `upgrade-xray.sh`：更新管理程序，可选更新 Xray-core。
 - `manager.py`：安装与升级共用的管理程序源码。
-- `tests/`：隔离环境中的升级与失败回滚测试。
+- `tests/`：隔离环境中的交互菜单、并发锁、流量累计、升级与失败回滚测试。
 - `.github/workflows/check.yml`：push 和 pull request 时运行语法检查和测试。
 
 在仓库目录验证源码：

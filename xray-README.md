@@ -12,6 +12,7 @@
 ├── upgrade-xray.sh              # 保留现有账号与配置的原地更新
 ├── manager.py                   # 管理程序源码
 ├── tests/
+│   ├── test_manager.py          # 交互菜单、并发锁和统计测试
 │   └── test_upgrade.py          # 隔离环境中的升级与回滚测试
 ├── .github/workflows/check.yml  # GitHub 自动语法检查和测试
 ├── .gitignore                   # 排除凭据、运行数据和备份
@@ -33,7 +34,7 @@ flowchart LR
 ```
 
 - `xray.service` 使用专用 `xray` 用户运行内核，读取服务端配置，处理代理连接并写日志。
-- `xray-manager` 是命令入口，调用 Python 管理程序；管理命令要求 root 权限。
+- `xray-manager` 是命令入口，调用 Python 管理程序；在交互终端中不带参数打开数字菜单，非交互环境中不带参数输出帮助。管理操作要求 root 权限，原有子命令仍可用于脚本。
 - `xray-stats.timer` 每约 60 秒触发 `xray-stats.service`，执行 `xray-manager collect`。
 - 管理程序通过只监听本机的统计 API 读取计数器，同时解析访问日志，将流量增量和已认证来源 IP 历史写入 SQLite。
 
@@ -98,6 +99,8 @@ journalctl -u xray-stats.service -n 50 --no-pager
 | `/var/lib/xray-manager/stats.sqlite3` | 持久化流量和来源 IP 历史的 SQLite 数据库 |
 | `/var/lib/xray-manager/manager.lock` | 管理命令互斥锁，防止并发采集或账号修改 |
 | `/var/lib/xray-manager/upgrade.lock` | 升级脚本互斥锁，防止同时执行多个升级 |
+
+`manager.lock` 仅在单次操作期间持有。菜单等待输入、确认和返回时已释放锁并关闭数据库连接，后台统计可继续执行。采集与设备修改保持互斥，增删设备的配置读取、校验、保存和重启在同一锁内完成；服务状态和服务日志查询不获取此锁。
 
 状态目录 `/var/lib/xray-manager` 权限为 `700`，仅 root 可访问。数据库内部结构：
 

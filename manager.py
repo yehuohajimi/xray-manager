@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import datetime as dt
+from contextlib import contextmanager
 import fcntl
 import glob
 import ipaddress
@@ -16,13 +17,19 @@ import uuid
 ROOT = pathlib.Path('/var/lib/xray-manager')
 CONFIG = pathlib.Path('/usr/local/etc/xray/config.json')
 XRAY = '/usr/local/bin/xray'
-os.umask(0o077)
-if os.geteuid() != 0:
-    sys.exit('Run with sudo/root')
-lock = (ROOT/'manager.lock').open('a')
-fcntl.flock(lock, fcntl.LOCK_EX)
-db = sqlite3.connect(ROOT/'stats.sqlite3')
-db.executescript('''
+db = None
+
+
+@contextmanager
+def manager_state(database=True):
+    """Serialize one operation; never hold state while asking for input."""
+    global db
+    with (ROOT/'manager.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            if database:
+                db = sqlite3.connect(ROOT/'stats.sqlite3')
+                db.executescript('''
 CREATE TABLE IF NOT EXISTS counters(name TEXT PRIMARY KEY, epoch TEXT, last INTEGER, total INTEGER);
 CREATE TABLE IF NOT EXISTS traffic(ts TEXT, name TEXT, bytes INTEGER);
 CREATE INDEX IF NOT EXISTS traffic_time ON traffic(ts);
@@ -30,6 +37,14 @@ CREATE TABLE IF NOT EXISTS sources(ts TEXT, ip TEXT, user TEXT);
 CREATE INDEX IF NOT EXISTS sources_time ON sources(ts);
 CREATE TABLE IF NOT EXISTS cursors(inode TEXT PRIMARY KEY, offset INTEGER);
 ''')
+            yield
+        finally:
+            try:
+                if db is not None:
+                    db.close()
+            finally:
+                db = None
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
 def run(*args):
     return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT, timeout=20)
@@ -131,68 +146,10 @@ def save(c):
 def human(n):
     return f'{n / 1024**3:.6f} GiB ({n:,} bytes)'
 
-cmd = sys.argv[1] if len(sys.argv)>1 else 'help'
-if cmd == 'reset-log-cursors':
-    db.execute('DELETE FROM cursors')
-    db.commit()
-elif cmd == 'collect':
-    collect()
-elif cmd == 'stats':
-    collect()
-    days = int(sys.argv[2]) if len(sys.argv)>2 else None
-    if days is not None:
-        if not 1 <= days <= 90:
-            sys.exit('days must be 1..90')
-        cutoff = (dt.datetime.now(dt.timezone.utc)-dt.timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
-        rows = db.execute('SELECT name,SUM(bytes) FROM traffic WHERE ts>=? GROUP BY name ORDER BY name',(cutoff,))
-        print(f'Last {days} days (UTC, sampled):')
-    else:
-        rows = db.execute('SELECT name,total FROM counters ORDER BY name')
-        print('Persisted totals since installation:')
-    for name, value in rows:
-        if not name.startswith('inbound>>>api-in'):
-            print(f'{name:58s} {human(value)}')
-elif cmd == 'ips':
-    collect_logs()
-    db.commit()
-    print('USER                     IP                                       FIRST UTC             LAST UTC              REQUESTS')
-    for user,ip,first,last,count in db.execute('SELECT user,ip,MIN(ts),MAX(ts),COUNT(*) FROM sources GROUP BY user,ip ORDER BY MAX(ts) DESC'):
-        print(f'{user:24s} {ip:40s} {first}  {last}  {count}')
-elif cmd == 'online':
-    port = inbound(config())['port']
-    print('Current TCP peers (includes unauthenticated/scanner connections):')
-    print(run('ss','-Hntip','state','established',f'( sport = :{port} )'))
-elif cmd == 'share':
-    share(sys.argv[2] if len(sys.argv)>2 else None)
-elif cmd == 'add-device':
-    if len(sys.argv)!=3 or not re.fullmatch(r'[A-Za-z0-9_-]{1,40}',sys.argv[2]):
-        sys.exit('Usage: xray-manager add-device NAME (letters/digits/_/-; 1..40 chars)')
-    name = sys.argv[2]
-    c = config()
-    users = inbound(c)['settings']['clients']
-    if any(u['email']==name for u in users):
-        sys.exit('Device name already exists')
-    users.append({'id':str(uuid.uuid4()),'email':name,'flow':'xtls-rprx-vision','level':0})
-    save(c)
-    share(name)
-elif cmd == 'remove-device':
-    if len(sys.argv)!=3:
-        sys.exit('Usage: xray-manager remove-device NAME')
-    c = config()
-    users = inbound(c)['settings']['clients']
-    new = [u for u in users if u['email']!=sys.argv[2]]
-    if len(new)==len(users):
-        sys.exit('Device not found')
-    inbound(c)['settings']['clients'] = new
-    save(c)
-    print('Device revoked; historical accounting retained.')
-elif cmd in ('restart','stop'):
-    collect()
-    print(run('systemctl',cmd,'xray'))
-elif cmd == 'status':
-    subprocess.run(['systemctl','status','xray','xray-stats.timer','--no-pager'])
-else:
+def help_text():
     print('''xray-manager status                  Service and sampler status
+xray-manager [menu]                  Interactive menu (requires a terminal)
+xray-manager list-devices            List account names without secret URLs
 xray-manager share [NAME]            Show secret client URLs
 xray-manager add-device NAME         New independent UUID; briefly restarts Xray
 xray-manager remove-device NAME      Revoke UUID; briefly restarts Xray
@@ -200,9 +157,238 @@ xray-manager stats [DAYS]            Persistent bytes; optional last 1..90 days
 xray-manager online                  Current inbound TCP IPs and socket counters
 xray-manager ips                     Authenticated source IP history, last 90 days
 xray-manager collect                 Sample now (also runs every minute)
+xray-manager start                   Start Xray
 xray-manager restart|stop            Sample before restarting/stopping
+xray-manager logs                    Last 100 service log entries
 uplink=user upload; downlink=user download. User/inbound/outbound are overlapping
 views: do not add them together. Historical bytes are per UUID, not per source IP.
 Abrupt crashes/reboots can lose bytes since the last sample (~1 minute).
 IP history records accepted requests, not exact device online/offline times.''')
-db.close()
+
+
+def device_names():
+    return [user['email'] for user in inbound(config())['settings']['clients']]
+
+
+def execute(args):
+    """Run a CLI operation. Validation and menu prompts happen outside the lock."""
+    cmd, *params = args
+    if cmd in ('help', '-h', '--help'):
+        help_text()
+        return
+    arity = {
+        'reset-log-cursors': (0, 0), 'collect': (0, 0), 'stats': (0, 1),
+        'ips': (0, 0), 'online': (0, 0), 'share': (0, 1),
+        'add-device': (1, 1), 'remove-device': (1, 1), 'list-devices': (0, 0),
+        'start': (0, 0), 'restart': (0, 0), 'stop': (0, 0),
+        'status': (0, 0), 'logs': (0, 0),
+    }
+    if cmd not in arity:
+        raise ValueError(f'Unknown command: {cmd}. Use xray-manager help')
+    low, high = arity[cmd]
+    if not low <= len(params) <= high:
+        raise ValueError(f'Invalid arguments for {cmd}. Use xray-manager help')
+    if cmd in ('add-device', 'remove-device', 'share') and params:
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,40}', params[0]):
+            raise ValueError('Device name must contain letters/digits/_/-; 1..40 chars')
+    days = None
+    if cmd == 'stats' and params:
+        try:
+            days = int(params[0])
+        except ValueError:
+            raise ValueError('days must be 1..90') from None
+        if not 1 <= days <= 90:
+            raise ValueError('days must be 1..90')
+    if os.geteuid() != 0:
+        raise PermissionError('Run with sudo/root')
+    os.umask(0o077)
+    # These queries neither access manager state nor interfere with collection.
+    if cmd == 'status':
+        subprocess.run(['systemctl', 'status', 'xray', 'xray-stats.timer', '--no-pager'], timeout=20)
+        return
+    if cmd == 'logs':
+        print(run('journalctl', '-u', 'xray', '-n', '100', '--no-pager'))
+        return
+    needs_db = cmd in ('reset-log-cursors', 'collect', 'stats', 'ips',
+                       'add-device', 'remove-device', 'restart', 'stop')
+    with manager_state(database=needs_db):
+        if cmd == 'reset-log-cursors':
+            db.execute('DELETE FROM cursors')
+            db.commit()
+        elif cmd == 'collect':
+            collect()
+        elif cmd == 'stats':
+            collect()
+            if days is not None:
+                cutoff = (dt.datetime.now(dt.timezone.utc)-dt.timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
+                rows = db.execute('SELECT name,SUM(bytes) FROM traffic WHERE ts>=? GROUP BY name ORDER BY name', (cutoff,))
+                print(f'Last {days} days (UTC, sampled):')
+            else:
+                rows = db.execute('SELECT name,total FROM counters ORDER BY name')
+                print('Persisted totals since installation:')
+            for name, value in rows:
+                if not name.startswith('inbound>>>api-in'):
+                    print(f'{name:58s} {human(value)}')
+        elif cmd == 'ips':
+            collect_logs()
+            db.commit()
+            print('USER                     IP                                       FIRST UTC             LAST UTC              REQUESTS')
+            for user, ip, first, last, count in db.execute('SELECT user,ip,MIN(ts),MAX(ts),COUNT(*) FROM sources GROUP BY user,ip ORDER BY MAX(ts) DESC'):
+                print(f'{user:24s} {ip:40s} {first}  {last}  {count}')
+        elif cmd == 'online':
+            port = inbound(config())['port']
+            print('Current TCP peers (includes unauthenticated/scanner connections):')
+            print(run('ss', '-Hntip', 'state', 'established', f'( sport = :{port} )'))
+        elif cmd == 'list-devices':
+            names = device_names()
+            print('\n'.join(names) if names else 'No devices configured.')
+        elif cmd == 'share':
+            if params and params[0] not in device_names():
+                raise ValueError('Device not found')
+            share(params[0] if params else None)
+        elif cmd == 'add-device':
+            name = params[0]
+            c = config()
+            users = inbound(c)['settings']['clients']
+            if any(u['email'] == name for u in users):
+                raise ValueError('Device name already exists')
+            users.append({'id': str(uuid.uuid4()), 'email': name, 'flow': 'xtls-rprx-vision', 'level': 0})
+            save(c)
+            share(name)
+        elif cmd == 'remove-device':
+            c = config()
+            users = inbound(c)['settings']['clients']
+            new = [u for u in users if u['email'] != params[0]]
+            if len(new) == len(users):
+                raise ValueError('Device not found')
+            inbound(c)['settings']['clients'] = new
+            save(c)
+            print('Device revoked; historical accounting retained.')
+        elif cmd in ('start', 'restart', 'stop'):
+            if cmd != 'start':
+                collect()
+            print(run('systemctl', cmd, 'xray'))
+
+
+MENU = '''
+Xray Manager
+  1. 服务状态                 2. 设备列表
+  3. 新增设备                 4. 撤销设备
+  5. 客户端分享链接           6. 流量统计
+  7. 当前 TCP 连接            8. 历史来源 IP
+  9. 启动服务                10. 重启服务
+ 11. 停止服务                12. 服务日志
+ 13. 立即采集统计             0. 退出
+'''
+
+
+def confirm(message):
+    return input(message + ' [y/N]: ').strip().lower() in ('y', 'yes', '是')
+
+
+def choose_device(allow_all=False):
+    # Take a snapshot, then release the lock before waiting for a selection.
+    with manager_state(database=False):
+        names = device_names()
+    if not names:
+        print('尚未配置设备。')
+        return None
+    for index, name in enumerate(names, 1):
+        print(f'  {index}. {name}')
+    if allow_all:
+        print('  a. 全部设备')
+    choice = input('选择设备编号（回车取消）: ').strip()
+    if not choice:
+        return None
+    if allow_all and choice.lower() == 'a':
+        return []
+    if not choice.isascii() or not choice.isdigit() or not 1 <= int(choice) <= len(names):
+        raise ValueError('请输入列表中的设备编号。')
+    return [names[int(choice)-1]]
+
+
+def menu_action(choice):
+    simple = {'1': 'status', '2': 'list-devices', '7': 'online',
+              '8': 'ips', '9': 'start', '12': 'logs', '13': 'collect'}
+    if choice in simple:
+        execute([simple[choice]])
+    elif choice == '3':
+        name = input('新设备名称（字母/数字/_/-，1–40 字符；回车取消）: ').strip()
+        if not name:
+            return
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,40}', name):
+            raise ValueError('设备名称仅允许 1–40 个英文字母、数字、下划线或连字符。')
+        if confirm(f'新增设备 {name} 会重启 Xray，现有连接将短暂中断。继续？'):
+            execute(['add-device', name])
+    elif choice in ('4', '5'):
+        selected = choose_device(allow_all=choice == '5')
+        if selected is None:
+            return
+        if choice == '5':
+            print('以下链接包含访问凭据，请妥善保存。')
+            execute(['share', *selected])
+        elif confirm(f'撤销 {selected[0]} 会使其链接失效并重启 Xray，保留历史统计。继续？'):
+            execute(['remove-device', *selected])
+    elif choice == '6':
+        days = input('最近多少天（1–90；回车查看安装以来累计；0 取消）: ').strip()
+        if days != '0':
+            execute(['stats', *([days] if days else [])])
+    elif choice in ('10', '11'):
+        cmd, label = ('restart', '重启') if choice == '10' else ('stop', '停止')
+        if confirm(f'{label} Xray 将中断现有连接。继续？'):
+            execute([cmd])
+    else:
+        raise ValueError('请输入菜单中的编号。')
+
+
+def report_error(error):
+    print(f'操作失败: {error}', file=sys.stderr)
+    if isinstance(error, subprocess.CalledProcessError) and error.output:
+        print(error.output, file=sys.stderr)
+
+
+def interactive_menu():
+    while True:
+        print(MENU)
+        choice = input('选择操作: ').strip()
+        if choice in ('0', 'q', 'quit', 'exit'):
+            return
+        if not choice:
+            continue
+        try:
+            menu_action(choice)
+        except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as error:
+            report_error(error)
+        input('\n按回车返回菜单…')
+
+
+def main(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
+    terminal = sys.stdin.isatty() and sys.stdout.isatty()
+    if not args:
+        args = ['menu' if terminal else 'help']
+    try:
+        if args[0] == 'menu':
+            if len(args) != 1:
+                raise ValueError('Usage: xray-manager menu')
+            if not terminal:
+                raise ValueError('交互菜单需要终端，请使用 SSH 登录后运行；脚本请使用子命令。')
+            if os.geteuid() != 0:
+                raise PermissionError('Run with sudo/root')
+            os.umask(0o077)
+            interactive_menu()
+        else:
+            execute(args)
+    except EOFError:
+        print('\n已退出。')
+    except KeyboardInterrupt:
+        print('\n已取消并退出。')
+        return 130
+    except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as error:
+        report_error(error)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
