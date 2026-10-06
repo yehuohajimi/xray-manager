@@ -145,4 +145,8 @@ Xray 正常运行时显示 `active (running)`，统计 timer 显示 `active (wai
 | `/var/lib/xray-manager/upgrade-*` | 原地升级前的备份目录，包含旧 `xray`、`manager.py`、`config.json`、`connection.json` 和 SQLite 在线备份 |
 | `/root/xray-backup-*` | 显式重装前保存的旧安装配置、服务文件、内核及状态目录等 |
 
-这些备份不会自动按 90 天统计保留策略清理。升级失败时，升级脚本自动恢复旧程序；恢复时沿用当前配置和统计库。人工备份 SQLite 应使用在线备份接口，具体命令见 [README.md 的备份章节](README.md#备份)。
+这些备份不会自动按 90 天统计保留策略清理。可使用交互菜单的“备份管理”或 `xray-manager backups` 查看列表，`xray-manager backup-info PATH` 查看文件详情，`xray-manager delete-backup PATH --yes` 删除指定备份；菜单删除需要确认。也支持 `/root/xray-stats-backup*.sqlite3` 和 `/root/xray-config-backup*.tar.gz` 手动备份。
+
+详情显示文件元数据，不输出配置或密钥内容，也不展开归档。删除仅接受识别的备份路径，拒绝符号链接入口；删除期间先获取 `upgrade.lock`，再获取 `manager.lock`，与升级脚本使用相同顺序，正在升级时拒绝删除。选择与确认期间不持有锁。
+
+升级失败时，升级脚本自动恢复旧程序；恢复时沿用当前配置和统计库。人工备份 SQLite 应使用在线备份接口，具体命令见 [README.md 的备份章节](README.md#备份)。

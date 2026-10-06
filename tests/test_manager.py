@@ -31,6 +31,8 @@ class ManagerTests(unittest.TestCase):
         self.manager.ROOT = self.root
         self.manager.CONFIG = self.root / 'config.json'
         self.manager.XRAY = str(self.root / 'xray')
+        self.manager.BACKUP_HOME = self.root / 'home'
+        self.manager.BACKUP_HOME.mkdir()
         self.manager.CONFIG.write_text(json.dumps({'inbounds': [{
             'tag': 'vless-in', 'port': 443,
             'settings': {'clients': [{'email': 'phone', 'id': 'original-uuid'}]},
@@ -89,14 +91,14 @@ class ManagerTests(unittest.TestCase):
         self.assert_unlocked()
 
     def test_menu_remains_usable_after_operation_failure(self):
-        with mock.patch('builtins.input', side_effect=['13', '', '2', '', '0']), \
+        with mock.patch('builtins.input', side_effect=['3', '5', '', '0', '2', '1', '', '0', '0']), \
                 mock.patch('builtins.print'), \
                 mock.patch.object(self.manager, 'collect', side_effect=RuntimeError('API unavailable')):
             self.manager.interactive_menu()
         self.assert_unlocked()
 
     def test_every_prompt_releases_state_and_allows_collection(self):
-        answers = iter(['4', '1', 'n', '', '5', '1', '', '0'])
+        answers = iter(['2', '4', '1', 'n', '', '3', '1', '', '0', '0'])
 
         def answer(prompt):
             self.assert_unlocked()
@@ -109,11 +111,15 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(self.totals(), [(10, 10)])
 
     def test_cancelled_changes_do_not_restart_or_stop(self):
-        for choice, answers in [('3', ['tablet', '']), ('4', ['1', 'n']),
-                                ('10', ['no']), ('11', ['']), ('5', [''])]:
+        for action, choice, answers in [
+                (self.manager.device_action, '2', ['tablet', '']),
+                (self.manager.device_action, '4', ['1', 'n']),
+                (self.manager.service_action, '2', ['no']),
+                (self.manager.service_action, '3', ['']),
+                (self.manager.device_action, '3', [''])]:
             with self.subTest(choice=choice), \
                     mock.patch('builtins.input', side_effect=answers), mock.patch('builtins.print'):
-                self.manager.menu_action(choice)
+                action(choice)
                 self.assert_unlocked()
         self.assertEqual(self.commands, [])
         self.assertEqual(self.manager.device_names(), ['phone'])
@@ -121,13 +127,13 @@ class ManagerTests(unittest.TestCase):
     def test_confirmed_menu_actions_and_share_all(self):
         with mock.patch('builtins.print') as output:
             with mock.patch('builtins.input', side_effect=['tablet', 'y']):
-                self.manager.menu_action('3')
+                self.manager.device_action('2')
             with mock.patch('builtins.input', return_value='a'):
-                self.manager.menu_action('5')
+                self.manager.device_action('3')
             with mock.patch('builtins.input', side_effect=['2', 'yes']):
-                self.manager.menu_action('4')
+                self.manager.device_action('4')
             with mock.patch('builtins.input', return_value='7'):
-                self.manager.menu_action('6')
+                self.manager.stats_action('1')
         self.assertEqual(self.manager.device_names(), ['phone'])
         self.assertTrue(any('tablet:' in str(call) for call in output.call_args_list))
         self.assertTrue(any('Last 7 days' in str(call) for call in output.call_args_list))
@@ -135,11 +141,11 @@ class ManagerTests(unittest.TestCase):
 
     def test_service_actions_collect_before_restart_and_stop(self):
         with mock.patch('builtins.print'), mock.patch('builtins.input', return_value='y'):
-            self.manager.menu_action('9')
+            self.manager.service_action('1')
             self.assertEqual(self.commands, [('systemctl', 'start', 'xray')])
-            for choice, command in [('10', 'restart'), ('11', 'stop')]:
+            for choice, command in [('2', 'restart'), ('3', 'stop')]:
                 self.commands.clear()
-                self.manager.menu_action(choice)
+                self.manager.service_action(choice)
                 self.assertEqual(self.commands[-1], ('systemctl', command, 'xray'))
                 self.assertTrue(any(args[0] == self.manager.XRAY and args[1] == 'api'
                                     for args in self.commands[:-1]))
@@ -216,6 +222,126 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(self.commands.count(('systemctl', 'restart', 'xray')), restarts)
         self.assert_unlocked()
 
+    def make_backups(self):
+        config = self.root / 'config-20261006T120000.json'
+        config.write_text('private-config')
+        upgrade = self.root / 'upgrade-20261006T120000-abc'
+        upgrade.mkdir()
+        (upgrade / 'config.json').write_text('private-upgrade')
+        (upgrade / 'stats.sqlite3').write_bytes(b'backup-db')
+        reinstall = self.manager.BACKUP_HOME / 'xray-backup-20261006T120000'
+        (reinstall / 'usr/local/etc/xray').mkdir(parents=True)
+        (reinstall / 'usr/local/etc/xray/config.json').write_text('private-reinstall')
+        archive = self.manager.BACKUP_HOME / 'xray-config-backup.tar.gz'
+        archive.write_bytes(b'archive')
+        database = self.manager.BACKUP_HOME / 'xray-stats-backup.sqlite3'
+        database.write_bytes(b'database')
+        return config, upgrade, reinstall, archive, database
+
+    def test_backup_listing_recognizes_types_and_preserves_live_state(self):
+        targets = self.make_backups()
+        with mock.patch('builtins.print') as output:
+            self.manager.execute(['backups'])
+        self.assertEqual({item[0] for item in self.manager.backup_candidates()}, set(targets))
+        text = '\n'.join(str(call) for call in output.call_args_list)
+        self.assertIn('共 5 个备份', text)
+        self.assertNotIn('private-config', text)
+        self.assertFalse((self.root / 'manager.lock').exists())
+        self.assertFalse((self.root / 'stats.sqlite3').exists())
+
+    def test_backup_details_do_not_follow_links_or_print_credentials(self):
+        _, upgrade, _, _, _ = self.make_backups()
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (outside / 'secret.key').write_text('private-secret')
+        (upgrade / 'linked-directory').symlink_to(outside, target_is_directory=True)
+        (self.root / 'config-symlink.json').symlink_to(self.manager.CONFIG)
+        with mock.patch('builtins.print') as output:
+            self.manager.execute(['backup-info', str(upgrade)])
+        text = '\n'.join(str(call) for call in output.call_args_list)
+        self.assertIn('stats.sqlite3', text)
+        self.assertIn('[符号链接]', text)
+        self.assertNotIn('secret.key', text)
+        self.assertNotIn('private-upgrade', text)
+        self.assertNotIn(self.root / 'config-symlink.json',
+                         {item[0] for item in self.manager.backup_candidates()})
+
+    def test_backup_delete_requires_explicit_confirmation_and_supported_path(self):
+        config, _, _, _, _ = self.make_backups()
+        for args in (['delete-backup', str(config)],
+                     ['delete-backup', str(config), '--no'],
+                     ['delete-backup', str(self.manager.CONFIG), '--yes'],
+                     ['delete-backup', str(self.root), '--yes'],
+                     ['delete-backup', str(self.root / 'upgrade.lock'), '--yes']):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                self.manager.execute(args)
+        self.assertTrue(config.exists())
+        self.assertTrue(self.manager.CONFIG.exists())
+        self.assertTrue((self.root / 'connection.json').exists())
+        self.assert_unlocked()
+
+    def test_backup_menu_cancel_and_waiting_input_allow_collection(self):
+        targets = self.make_backups()
+        answers = iter(['1', ''])
+
+        def answer(prompt):
+            self.assert_unlocked()
+            self.manager.execute(['collect'])
+            return next(answers)
+
+        with mock.patch('builtins.input', side_effect=answer), mock.patch('builtins.print'):
+            self.manager.backup_action('3')
+        self.assertTrue(all(target.exists() for target in targets))
+        self.assertEqual(self.totals(), [(10, 10)])
+
+    def test_delete_backup_files_and_directory_leaves_link_targets_and_live_db(self):
+        targets = self.make_backups()
+        _, upgrade, _, _, _ = targets
+        (upgrade / 'live-config-link').symlink_to(self.manager.CONFIG)
+        self.manager.execute(['collect'])
+        with mock.patch('builtins.print'):
+            for target in targets:
+                self.manager.execute(['delete-backup', str(target), '--yes'])
+        self.assertEqual(self.manager.backup_candidates(), [])
+        self.assertTrue(self.manager.CONFIG.exists())
+        self.assertTrue((self.root / 'connection.json').exists())
+        self.assertEqual(self.totals(), [(10, 10)])
+        self.assert_unlocked()
+
+    def test_deletion_during_upgrade_is_refused_and_locks_release(self):
+        config, _, _, _, _ = self.make_backups()
+        with (self.root / 'upgrade.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with self.assertRaisesRegex(RuntimeError, '升级正在进行'):
+                self.manager.execute(['delete-backup', str(config), '--yes'])
+            self.assertTrue(config.exists())
+        with mock.patch('builtins.print'):
+            self.manager.execute(['delete-backup', str(config), '--yes'])
+        self.assertFalse(config.exists())
+        self.assert_unlocked()
+
+    def test_backup_selection_replacement_is_rejected(self):
+        config, _, _, _, _ = self.make_backups()
+        info = config.stat()
+        config.rename(self.root / 'saved-original')
+        config.write_text('replacement-backup')
+        with self.assertRaisesRegex(ValueError, '已发生变化'):
+            self.manager.execute(['delete-backup', str(config), '--yes'],
+                                 backup_identity=(info.st_dev, info.st_ino))
+        self.assertEqual(config.read_text(), 'replacement-backup')
+        self.assert_unlocked()
+
+    def test_backup_menu_confirmed_deletion_and_empty_listing(self):
+        target = self.root / 'config-20261006.json'
+        target.write_text('private')
+        with mock.patch('builtins.print'), mock.patch('builtins.input', side_effect=['1', 'y']):
+            self.manager.backup_action('3')
+        self.assertFalse(target.exists())
+        with mock.patch('builtins.print') as output, mock.patch('builtins.input') as prompt:
+            self.manager.backup_action('2')
+            prompt.assert_not_called()
+        self.assertTrue(any('暂无备份' in str(call) for call in output.call_args_list))
+
     def prepare_processes(self):
         # Import the real source, redirect state and service commands into the fixture.
         (self.root / 'runner.py').write_text(
@@ -225,6 +351,7 @@ class ManagerTests(unittest.TestCase):
             'spec.loader.exec_module(m)\n'
             f'm.ROOT = pathlib.Path({str(self.root)!r})\n'
             'm.CONFIG = m.ROOT / "config.json"\n'
+            'm.BACKUP_HOME = m.ROOT / "home"\n'
             'm.XRAY = str(m.ROOT / "xray")\n'
             'm.os.geteuid = lambda: 0\n'
             'm.glob.glob = lambda pattern: []\n'
@@ -294,6 +421,9 @@ class ManagerTests(unittest.TestCase):
 
         read_until('选择操作:')
         collect_while_waiting()
+        os.write(master, b'2\n')
+        read_until('选择操作:')
+        collect_while_waiting()
         os.write(master, b'4\n')
         read_until('选择设备编号')
         collect_while_waiting()
@@ -305,6 +435,14 @@ class ManagerTests(unittest.TestCase):
         collect_while_waiting()
         os.write(master, b'\n')
         read_until('选择操作:')
+        os.write(master, b'0\n')
+        read_until('选择操作:')
+        for choice in (b'3\n', b'4\n', b'5\n'):
+            os.write(master, choice)
+            read_until('选择操作:')
+            collect_while_waiting()
+            os.write(master, b'0\n')
+            read_until('选择操作:')
         os.write(master, b'0\n')
         self.assertEqual(menu.wait(timeout=5), 0)
         self.assertEqual(self.totals(), [(10, 10)])
