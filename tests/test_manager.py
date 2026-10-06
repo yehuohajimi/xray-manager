@@ -139,6 +139,77 @@ class ManagerTests(unittest.TestCase):
         self.assertTrue(any('Last 7 days' in str(call) for call in output.call_args_list))
         self.assert_unlocked()
 
+    def test_share_menu_prints_matching_qr_below_link_without_lock(self):
+        code = '\x1b[37;40m██▀▄\x1b[0m\n'
+
+        def encode(args, **kwargs):
+            self.assert_unlocked()
+            self.manager.execute(['collect'])
+            self.assertEqual(args[0], 'qrencode')
+            self.assertNotIn(kwargs['input'], args)
+            self.assertEqual(kwargs['stderr'], subprocess.DEVNULL)
+            self.assertEqual(kwargs['timeout'], 10)
+            return code
+
+        with mock.patch('builtins.input', return_value='1'), \
+                mock.patch('builtins.print') as output, \
+                mock.patch.object(self.manager.subprocess, 'check_output', side_effect=encode) as encoder, \
+                mock.patch.object(self.manager.shutil, 'get_terminal_size', return_value=os.terminal_size((100, 40))):
+            self.manager.device_action('3')
+        printed = [call.args[0] for call in output.call_args_list if call.args]
+        link_index = next(i for i, line in enumerate(printed) if 'vless://' in line)
+        self.assertEqual(encoder.call_args.kwargs['input'], printed[link_index].split('\n')[1])
+        self.assertIn('分享二维码', printed[link_index + 1])
+        self.assertEqual(printed[link_index + 2], code)
+        self.assertEqual(self.totals(), [(10, 10)])
+        self.assert_unlocked()
+
+    def test_share_all_encodes_each_devices_own_link(self):
+        with mock.patch('builtins.print'):
+            self.manager.execute(['add-device', 'tablet'])
+        code = '\x1b[37;40m██\x1b[0m\n'
+        with mock.patch('builtins.input', return_value='a'), \
+                mock.patch('builtins.print') as output, \
+                mock.patch.object(self.manager.subprocess, 'check_output', return_value=code) as encoder:
+            self.manager.device_action('3')
+        links = [call.args[0].split('\n')[1] for call in output.call_args_list
+                 if call.args and '\nvless://' in call.args[0]]
+        self.assertEqual(len(links), 2)
+        self.assertNotEqual(links[0], links[1])
+        self.assertEqual([call.kwargs['input'] for call in encoder.call_args_list], links)
+        self.assertEqual(sum(call.args == (code,) for call in output.call_args_list), 2)
+
+    def test_cli_share_stays_plain_text_without_qr_dependency(self):
+        with mock.patch('builtins.print') as output, \
+                mock.patch.object(self.manager.subprocess, 'check_output') as encoder:
+            self.manager.execute(['share', 'phone'])
+        encoder.assert_not_called()
+        self.assertEqual(len(output.call_args_list), 1)
+        self.assertIn('\nvless://', output.call_args.args[0])
+
+    def test_qr_failure_retains_link_and_menu_can_continue(self):
+        for error in (FileNotFoundError(), subprocess.CalledProcessError(1, 'qrencode'),
+                      subprocess.TimeoutExpired('qrencode', 10), UnicodeError()):
+            with self.subTest(error=type(error).__name__), \
+                    mock.patch('builtins.print') as output, \
+                    mock.patch.object(self.manager.subprocess, 'check_output', side_effect=error):
+                self.manager.execute(['share', 'phone'], qr=True)
+            printed = [call.args[0] for call in output.call_args_list if call.args]
+            self.assertIn('\nvless://', printed[0])
+            self.assertTrue(any('复制上方链接' in line for line in printed))
+            self.assert_unlocked()
+
+    def test_narrow_terminal_reports_required_width_without_wrapping_qr(self):
+        code = '\x1b[37;40m' + '█' * 81 + '\x1b[0m\n'
+        with mock.patch('builtins.print') as output, \
+                mock.patch.object(self.manager.subprocess, 'check_output', return_value=code), \
+                mock.patch.object(self.manager.shutil, 'get_terminal_size', return_value=os.terminal_size((80, 24))):
+            self.manager.execute(['share', 'phone'], qr=True)
+        printed = [call.args[0] for call in output.call_args_list if call.args]
+        self.assertIn('\nvless://', printed[0])
+        self.assertTrue(any('至少 81 列' in line for line in printed))
+        self.assertNotIn(code, printed)
+
     def test_service_actions_collect_before_restart_and_stop(self):
         with mock.patch('builtins.print'), mock.patch('builtins.input', return_value='y'):
             self.manager.service_action('1')

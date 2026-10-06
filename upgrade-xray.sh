@@ -29,6 +29,13 @@ ast.parse(pathlib.Path(sys.argv[1]).read_text(), filename=sys.argv[1])
 PY
 runuser -u xray -- "$core" run -test -config "$config"
 
+# Existing installs gain terminal QR sharing without replacing proxy identities.
+if ! command -v qrencode >/dev/null; then
+    echo 'Installing qrencode for terminal client sharing'
+    apt-get update
+    apt-get install -y qrencode
+fi
+
 # Keep concurrent upgrade runs apart. manager.py has its own lock for collection.
 exec 9>"$state/upgrade.lock"
 flock -n 9 || { echo 'Another upgrade is running'; exit 1; }

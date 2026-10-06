@@ -37,6 +37,7 @@ class UpgradeTests(unittest.TestCase):
             'if [[ ${FAIL_SECOND_COLLECT:-0} == 1 && $n == 2 ]]; then exit 1; fi',
         )
         self.command("mock/runuser", "exit 0")
+        self.command("mock/qrencode", "exit 0")
         self.command(
             "mock/systemctl",
             'printf "%s\\n" "$*" >> "$TEST_ROOT/service-calls"\n'
@@ -107,6 +108,24 @@ class UpgradeTests(unittest.TestCase):
         self.assertIn("stop xray-stats.timer", (self.root / "service-calls").read_text())
         self.assertIn("start xray-stats.timer", (self.root / "service-calls").read_text())
         self.assertEqual(len(list((self.root / "state").glob("upgrade-*/stats.sqlite3"))), 1)
+
+    def test_upgrade_installs_missing_qr_dependency(self):
+        (self.root / 'mock/qrencode').unlink()
+        self.command('mock/apt-get', 'printf "%s\\n" "$*" >> "$TEST_ROOT/dependency-calls"\nexit 0')
+        result = self.run_upgrade()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / 'dependency-calls').read_text(), 'update\ninstall -y qrencode\n')
+        self.assert_retained()
+
+    def test_qr_dependency_install_failure_leaves_existing_install_untouched(self):
+        (self.root / 'mock/qrencode').unlink()
+        self.command('mock/apt-get', 'exit 9')
+        result = self.run_upgrade()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.root / 'lib/manager.py').read_text(), '# old manager\n')
+        self.assertNotIn('stop xray-stats.timer', (self.root / 'service-calls').read_text())
+        self.assertEqual(list((self.root / 'state').glob('upgrade-*')), [])
+        self.assert_retained()
 
     def test_failed_collection_restores_manager_and_timer(self):
         result = self.run_upgrade(fail=True)

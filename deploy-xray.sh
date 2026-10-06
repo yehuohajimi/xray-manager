@@ -6,12 +6,12 @@ umask 077
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 [[ -f $script_dir/manager.py ]] || { echo 'manager.py is missing next to deploy-xray.sh'; exit 1; }
 [[ $EUID == 0 ]] || { echo 'Run as root'; exit 1; }
-SERVER_IP=${SERVER_IP:?Set SERVER_IP to the public IPv4 address or hostname}
+SERVER_IP=${SERVER_IP:-}
 PORT=${PORT:-443}
 SNI=${SNI:-www.cloudflare.com}
 VERSION=${VERSION:-v26.3.27}
 REINSTALL=${REINSTALL:-0}
-export SERVER_IP PORT SNI
+export PORT SNI
 [[ $PORT =~ ^[0-9]{1,5}$ ]] || { echo 'PORT must be an integer from 1 to 65535'; exit 1; }
 PORT=$((10#$PORT))
 (( PORT > 0 && PORT < 65536 && PORT != 10085 )) || { echo 'PORT must be 1..65535, excluding the statistics API port 10085'; exit 1; }
@@ -19,8 +19,85 @@ PORT=$((10#$PORT))
 [[ $REINSTALL == 0 || $REINSTALL == 1 ]] || { echo 'REINSTALL must be 0 or 1'; exit 1; }
 command -v apt-get >/dev/null
 [[ -d /run/systemd/system ]] || { echo 'systemd required'; exit 1; }
+existing_install=0
 if [[ -e /usr/local/etc/xray/config.json || -x /usr/local/bin/xray || -x /usr/bin/xray ]] || systemctl cat xray.service &>/dev/null; then
+  existing_install=1
   [[ $REINSTALL == 1 ]] || { echo 'Existing Xray found. Use upgrade-xray.sh to preserve accounts and config. REINSTALL=1 rebuilds the proxy identity.'; exit 1; }
+fi
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y ca-certificates curl unzip python3 openssl iproute2 logrotate qrencode
+
+normalize_server() {
+  python3 - "$1" "$2" <<'PY'
+import ipaddress, re, sys
+value, mode = sys.argv[1].strip(), sys.argv[2]
+if mode == 'auto':
+    # Cloudflare returns a trace; ipify returns only the address.
+    matches = [line[3:].strip() for line in value.splitlines() if line.startswith('ip=')]
+    if matches:
+        value = matches[0] if len(matches) == 1 else ''
+    try:
+        address = ipaddress.IPv4Address(value)
+        if not address.is_global or address.is_multicast:
+            raise ValueError('not a public IPv4')
+    except ValueError:
+        sys.exit(1)
+    print(address)
+else:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        try:
+            host = value.rstrip('.').encode('idna').decode('ascii').lower()
+        except UnicodeError:
+            sys.exit('SERVER_IP must be an IPv4 address or domain name')
+        labels = host.split('.')
+        if (len(host) > 253 or len(labels) < 2 or labels[-1].isdigit()
+                or any(not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label)
+                       for label in labels)):
+            sys.exit('SERVER_IP must be an IPv4 address or domain name, without a scheme, port or path')
+        print(host)
+    else:
+        if address.version != 4:
+            sys.exit('This installer listens on IPv4; set SERVER_IP to an IPv4 address or IPv4-reachable domain')
+        print(address)
+PY
+}
+
+if [[ -n $SERVER_IP ]]; then
+  SERVER_IP=$(normalize_server "$SERVER_IP" manual)
+else
+  echo 'Detecting public IPv4 for client links...'
+  for endpoint in https://api.ipify.org https://www.cloudflare.com/cdn-cgi/trace; do
+    # Use direct IPv4 requests so proxy environment variables do not supply a proxy IP.
+    if response=$(curl --ipv4 --noproxy '*' --fail --silent --show-error \
+        --connect-timeout 3 --max-time 5 --max-filesize 4096 "$endpoint" 2>/dev/null) \
+        && detected=$(normalize_server "$response" auto); then
+      SERVER_IP=$detected
+      echo "Detected public IPv4: $SERVER_IP"
+      break
+    fi
+  done
+  if [[ -z $SERVER_IP ]]; then
+    if [[ -t 0 ]]; then
+      while :; do
+        read -r -p '无法探测公网 IPv4，请输入客户端连接用的 IPv4 或域名（回车退出）: ' address \
+          || { echo 'Installation cancelled'; exit 1; }
+        [[ -n $address ]] || { echo 'Installation cancelled'; exit 1; }
+        if SERVER_IP=$(normalize_server "$address" manual); then break; fi
+      done
+    else
+      echo "Could not detect public IPv4. Set SERVER_IP='your public IPv4 or domain' and rerun." >&2
+      exit 1
+    fi
+  fi
+fi
+export SERVER_IP
+
+# Resolve the client address before stopping or replacing an existing installation.
+if (( existing_install )); then
   backup=/root/xray-backup-$(date -u +%Y%m%dT%H%M%SZ)
   mkdir -m 700 "$backup"
   for p in /usr/local/etc/xray /etc/xray /etc/systemd/system/xray.service /etc/systemd/system/xray.service.d /usr/local/bin/xray /var/lib/xray-manager; do
@@ -38,9 +115,6 @@ if ss -H -lnt "sport = :$PORT" | grep -q .; then
   echo "TCP $PORT is occupied; stop the owning service or choose another PORT."
   exit 1
 fi
-export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y ca-certificates curl unzip python3 openssl iproute2 logrotate
 case $(uname -m) in
   x86_64) arch=64 ;;
   aarch64) arch=arm64-v8a ;;
@@ -191,5 +265,5 @@ systemctl enable --now xray-stats.timer
 /usr/local/bin/xray-manager collect
 echo 'Installation complete. Client credentials (keep private):'
 /usr/local/bin/xray-manager share
-echo 'Use: xray-manager help'
+echo 'Use: xray-manager to open the interactive menu'
 echo 'If your provider has a firewall/security group, permit the chosen TCP port there.'

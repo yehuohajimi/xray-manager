@@ -18,12 +18,7 @@
 
 公开仓库可以通过 HTTPS 克隆，无需给 VPS 配置 GitHub 登录凭据。
 
-```bash
-apt-get update
-apt-get install -y git ca-certificates
 git clone https://github.com/yehuohajimi/xray-manager.git /root/xray-manager
-cd /root/xray-manager
-```
 
 仓库中已有代码时使用 `git pull --ff-only`。安装脚本需要同目录的 `manager.py`，请克隆完整仓库。
 
@@ -33,12 +28,22 @@ cd /root/xray-manager
 
 ```bash
 cd /root/xray-manager
+bash deploy-xray.sh
+```
+
+无需填写公网地址：脚本会通过两个 HTTPS 服务自动探测公网 IPv4，并用它生成客户端链接。探测优先使用 ipify，失败或返回无效地址时改用 Cloudflare；请求绕过环境变量中的 HTTP 代理，每个服务最多等待 5 秒。探测失败时，交互终端会提示输入 IPv4 或域名；非交互执行会退出并提示通过 `SERVER_IP` 指定。已有安装仍需使用升级脚本，普通安装不会覆盖账号。
+
+如果想使用域名，或服务器的入口地址与出口公网 IP 不同，可手动覆盖：
+
+```bash
 SERVER_IP='你的公网IPv4或域名' bash deploy-xray.sh
 ```
 
+`SERVER_IP` 仅用于客户端链接的连接地址，Xray 仍监听 `0.0.0.0`。当前安装采用 IPv4 入站，域名应能解析到可连接的 IPv4；只填主机名，不带 `https://`、端口或路径。
+
 | 参数 | 默认值 | 用途 |
 |---|---|---|
-| `SERVER_IP` | 必填 | 客户端连接的公网 IPv4 或域名 |
+| `SERVER_IP` | 自动探测公网 IPv4 | 可手动指定客户端连接的 IPv4 或域名 |
 | `PORT` | `443` | 代理 TCP 监听端口，范围 1..65535，不能使用统计 API 端口 10085 |
 | `SNI` | `www.cloudflare.com` | REALITY 目标站点及 serverName |
 | `VERSION` | `v26.3.27` | 首次安装的 Xray-core 正式版本标签 |
@@ -51,7 +56,7 @@ SERVER_IP='你的公网IPv4或域名' PORT=443 SNI=www.cloudflare.com VERSION=v2
 已有本项目的标准安装时，使用下节的升级脚本即可保留设备账号。只有需要重新生成代理身份时才使用显式重装：
 
 ```bash
-SERVER_IP='你的公网IPv4或域名' REINSTALL=1 bash deploy-xray.sh
+REINSTALL=1 bash deploy-xray.sh
 ```
 
 **重装会备份旧配置、替换旧安装，并重新生成 UUID、REALITY 密钥和 shortId，旧客户端链接随之失效。** SQLite 历史统计保留；同名账号的累计值会继续累计。
@@ -108,7 +113,9 @@ xray-manager menu
 | 备份管理 | 查看备份列表、大小及时间，查看文件详情，删除选中的备份 |
 | 服务控制 | 启动、重启、停止 Xray |
 
-设备列表只显示账号名，分享链接可选择单个或全部设备。子菜单输入 `0` 或 `q` 返回主菜单；从子菜单返回后直接显示主菜单。
+设备列表只显示账号名，分享链接可选择单个或全部设备。每条 `vless://` 链接下方显示对应的终端二维码，方便在移动客户端中选择扫码导入；二维码使用同一条完整链接，在本机生成。终端宽度不足时会提示所需列数，扩大窗口或缩小字体后重新分享即可。子菜单输入 `0` 或 `q` 返回主菜单；从子菜单返回后直接显示主菜单。
+
+二维码使用 `qrencode`，安装和升级脚本会安装缺失的依赖。若仅手动复制管理程序，可执行 `apt-get update` 和 `apt-get install -y qrencode` 安装。依赖缺失或生成失败时仍输出链接；命令行子命令 `xray-manager share [NAME]` 保持纯文本输出，便于复制和脚本使用。
 
 新增/撤销设备、重启和停服会提示连接影响并要求确认，默认取消。备份删除也需要确认，删除后无法使用该备份恢复。操作完成或失败后按回车返回当前菜单；主菜单输入 `0` 或 `q` 退出，Ctrl+C 或输入结束也可退出。
 

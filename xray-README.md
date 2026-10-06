@@ -12,6 +12,7 @@
 ├── upgrade-xray.sh              # 保留现有账号与配置的原地更新
 ├── manager.py                   # 管理程序源码
 ├── tests/
+│   ├── test_deploy.py           # 安装地址探测、手动覆盖和失败处理测试
 │   ├── test_manager.py          # 交互菜单、并发锁和统计测试
 │   └── test_upgrade.py          # 隔离环境中的升级与回滚测试
 ├── .github/workflows/check.yml  # GitHub 自动语法检查和测试
@@ -50,7 +51,7 @@ flowchart LR
 
 `config.json` 包含代理与统计 API 入站、设备账号 UUID/email/flow、REALITY 私钥与 shortId、统计策略、出站及路由规则。配置文件所有者为 `root:xray`，权限为 `640`，Xray 服务用户可以读取。
 
-`connection.json` 包含 `server` 和 `public_key` 两个字段，管理程序将它与主配置一起用于生成 `vless://` 链接。它位于仅 root 可访问的状态目录中。
+`connection.json` 包含 `server` 和 `public_key` 两个字段，管理程序将它与主配置一起用于生成 `vless://` 链接。安装时 `server` 默认自动探测公网 IPv4，也可通过 `SERVER_IP` 手动指定 IPv4 或域名；这个字段用于客户端连接地址，不改变 Xray 的 IPv4 监听地址。它位于仅 root 可访问的状态目录中。
 
 修改主配置后，在 VPS 上先校验，再通过管理命令重启：
 

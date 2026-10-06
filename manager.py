@@ -115,16 +115,60 @@ def config():
 def inbound(c):
     return next(i for i in c['inbounds'] if i['tag']=='vless-in')
 
-def share(name=None):
+def share_links(name=None):
     c = inbound(config())
     info = json.loads((ROOT/'connection.json').read_text())
     reality = c['streamSettings']['realitySettings']
+    links = []
     for user in c['settings']['clients']:
         if name and user['email'] != name:
             continue
         params = urllib.parse.urlencode({'encryption':'none','security':'reality','sni':reality['serverNames'][0],
             'fp':'chrome','pbk':info['public_key'],'sid':reality['shortIds'][0],'type':'tcp','flow':'xtls-rprx-vision','spx':'/'})
-        print(f"{user['email']}:\nvless://{user['id']}@{info['server']}:{c['port']}?{params}#{urllib.parse.quote(user['email'])}")
+        link = f"vless://{user['id']}@{info['server']}:{c['port']}?{params}#{urllib.parse.quote(user['email'])}"
+        links.append((user['email'], link))
+    if name and not links:
+        raise ValueError('Device not found')
+    return links
+
+
+def print_qr(link):
+    try:
+        # Pass credentials through stdin, never command-line arguments or files.
+        code = subprocess.check_output(
+            ['qrencode', '-t', 'ANSIUTF8', '-l', 'M', '-m', '4', '-o', '-'],
+            input=link, encoding='utf-8', stderr=subprocess.DEVNULL, timeout=10)
+    except FileNotFoundError:
+        print('二维码不可用：请安装 qrencode（apt-get install -y qrencode），或复制上方链接导入。')
+        return
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        print('二维码生成失败，可复制上方链接导入。')
+        return
+    plain = re.sub(r'\x1b\[[0-9;]*m', '', code)
+    width = max((len(line) for line in plain.splitlines()), default=0)
+    if not width:
+        print('二维码生成失败，可复制上方链接导入。')
+        return
+    if shutil.get_terminal_size().columns < width:
+        print(f'二维码需要至少 {width} 列宽度，请扩大终端窗口或缩小字体后重新分享。')
+        return
+    print('分享二维码（在手机客户端中选择扫码导入）:')
+    try:
+        print(code, end='' if code.endswith('\n') else '\n')
+    except UnicodeError:
+        print('当前终端不支持二维码字符，请使用 UTF-8 终端或复制上方链接导入。')
+
+
+def print_shares(links, qr=False):
+    for name, link in links:
+        print(f'{name}:\n{link}')
+        if qr:
+            print_qr(link)
+            print()
+
+
+def share(name=None):
+    print_shares(share_links(name))
 
 def save(c):
     candidate = CONFIG.with_suffix('.pending.json')
@@ -288,7 +332,7 @@ def delete_backup(path, expected_identity=None):
     print(f'已删除备份: {target}')
 
 
-def execute(args, backup_identity=None):
+def execute(args, backup_identity=None, qr=False):
     """Run a CLI operation. Validation and menu prompts happen outside the lock."""
     cmd, *params = args
     if cmd in ('help', '-h', '--help'):
@@ -339,6 +383,12 @@ def execute(args, backup_identity=None):
     if cmd == 'logs':
         print(run('journalctl', '-u', 'xray', '-n', '100', '--no-pager'))
         return
+    if cmd == 'share':
+        with manager_state(database=False):
+            links = share_links(params[0] if params else None)
+        # Generating/displaying QR codes must not block the background collector.
+        print_shares(links, qr=qr)
+        return
     needs_db = cmd in ('reset-log-cursors', 'collect', 'stats', 'ips',
                        'add-device', 'remove-device', 'restart', 'stop')
     with manager_state(database=needs_db):
@@ -372,10 +422,6 @@ def execute(args, backup_identity=None):
         elif cmd == 'list-devices':
             names = device_names()
             print('\n'.join(names) if names else 'No devices configured.')
-        elif cmd == 'share':
-            if params and params[0] not in device_names():
-                raise ValueError('Device not found')
-            share(params[0] if params else None)
         elif cmd == 'add-device':
             name = params[0]
             c = config()
@@ -488,7 +534,7 @@ def device_action(choice):
             return
         if choice == '3':
             print('以下链接包含访问凭据，请妥善保存。')
-            execute(['share', *selected])
+            execute(['share', *selected], qr=True)
         elif confirm(f'撤销 {selected[0]} 会使其链接失效并重启 Xray，保留历史统计。继续？'):
             execute(['remove-device', *selected])
     else:
