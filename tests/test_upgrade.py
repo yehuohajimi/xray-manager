@@ -1,6 +1,8 @@
 """Exercise the in-place upgrade flow with isolated fake service commands."""
 
 import os
+import fcntl
+from contextlib import closing
 import pathlib
 import sqlite3
 import subprocess
@@ -24,12 +26,14 @@ class UpgradeTests(unittest.TestCase):
         (self.root / "lib/manager.py").write_text("# old manager\n")
         (self.root / "config.json").write_text('{"clients":["device-1"]}\n')
         (self.root / "state/connection.json").write_text('{"public_key":"keep"}\n')
-        with sqlite3.connect(self.root / "state/stats.sqlite3") as db:
+        with closing(sqlite3.connect(self.root / "state/stats.sqlite3")) as db, db:
             db.execute("CREATE TABLE retained (value TEXT)")
             db.execute("INSERT INTO retained VALUES ('traffic')")
         self.command("bin/xray", "exit 0")
         self.command(
             "bin/xray-manager",
+            'exec 7>"$TEST_ROOT/state/manager.lock"\n'
+            'flock 7\n'
             'calls="$TEST_ROOT/state/collect-calls"\n'
             'n=$(cat "$calls" 2>/dev/null || printf 0)\n'
             'n=$((n + 1))\n'
@@ -92,12 +96,13 @@ class UpgradeTests(unittest.TestCase):
             env=env,
             capture_output=True,
             text=True,
+            timeout=15,
         )
 
     def assert_retained(self):
         self.assertEqual((self.root / "config.json").read_text(), '{"clients":["device-1"]}\n')
         self.assertEqual((self.root / "state/connection.json").read_text(), '{"public_key":"keep"}\n')
-        with sqlite3.connect(self.root / "state/stats.sqlite3") as db:
+        with closing(sqlite3.connect(self.root / "state/stats.sqlite3")) as db:
             self.assertEqual(db.execute("SELECT value FROM retained").fetchone(), ("traffic",))
 
     def test_manager_upgrade_preserves_state(self):
@@ -155,6 +160,78 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual((self.root / "lib/manager.py").read_text(), "# old manager\n")
         self.assert_retained()
         self.assertEqual((self.root / "restart-calls").read_text(), "2")
+
+    def test_bad_core_checksum_leaves_existing_service_and_programs_untouched(self):
+        self.prepare_release()
+        (self.root / 'release.dgst').write_text('0' * 64 + '\n')
+        result = self.run_upgrade(version=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('new core', (self.root / 'bin/xray').read_text())
+        self.assertEqual((self.root / 'lib/manager.py').read_text(), '# old manager\n')
+        self.assertNotIn('stop xray-stats.timer', (self.root / 'service-calls').read_text())
+        self.assert_retained()
+
+    def test_core_post_update_collection_failure_rolls_back_both_programs(self):
+        self.prepare_release()
+        result = self.run_upgrade(version=True, fail=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('new core', (self.root / 'bin/xray').read_text())
+        self.assertEqual((self.root / 'lib/manager.py').read_text(), '# old manager\n')
+        self.assertIn('start xray-stats.timer', (self.root / 'service-calls').read_text())
+        self.assert_retained()
+
+    def test_program_switch_and_rollback_hold_manager_lock(self):
+        self.prepare_release()
+        (self.root / 'check-manager-lock.py').write_text('''
+import fcntl, os, pathlib
+root = pathlib.Path(os.environ['TEST_ROOT'])
+with (root / 'state/manager.lock').open('a') as lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        state = 'held'
+    else:
+        state = 'free'
+with (root / 'switch-locks').open('a') as output:
+    output.write(state + '\\n')
+''')
+        systemctl = self.root / 'mock/systemctl'
+        systemctl.write_text(systemctl.read_text().replace(
+            '#!/usr/bin/env bash\n',
+            '#!/usr/bin/env bash\nif [[ $1 == restart ]]; then python3 "$TEST_ROOT/check-manager-lock.py"; fi\n'))
+        result = self.run_upgrade(version=True, fail=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.root / 'switch-locks').read_text(), 'held\nheld\n')
+        with (self.root / 'state/manager.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.assert_retained()
+
+    def test_concurrent_upgrade_is_refused_before_backup_or_switch(self):
+        with (self.root / 'state/upgrade.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            result = self.run_upgrade()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Another upgrade is running', result.stdout)
+        self.assertEqual(list((self.root / 'state').glob('upgrade-*')), [])
+        self.assertEqual((self.root / 'lib/manager.py').read_text(), '# old manager\n')
+        self.assert_retained()
+
+    def test_timer_resume_failure_rolls_back_programs_then_retries_timer(self):
+        self.prepare_release()
+        systemctl = self.root / 'mock/systemctl'
+        systemctl.write_text(systemctl.read_text().replace(
+            '#!/usr/bin/env bash\n',
+            '#!/usr/bin/env bash\n'
+            'if [[ $1 == start && $2 == xray-stats.timer && ! -e "$TEST_ROOT/timer-failed" ]]; then\n'
+            '  touch "$TEST_ROOT/timer-failed"\n'
+            '  exit 1\n'
+            'fi\n'))
+        result = self.run_upgrade(version=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('new core', (self.root / 'bin/xray').read_text())
+        self.assertEqual((self.root / 'lib/manager.py').read_text(), '# old manager\n')
+        self.assertIn('start xray-stats.timer', (self.root / 'service-calls').read_text())
+        self.assert_retained()
 
 
 if __name__ == "__main__":

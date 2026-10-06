@@ -508,7 +508,7 @@ class ManagerTests(unittest.TestCase):
         read_until('选择操作:')
         os.write(master, b'0\n')
         read_until('选择操作:')
-        for choice in (b'3\n', b'4\n', b'5\n'):
+        for choice in (b'3\n', b'4\n', b'5\n', b'6\n'):
             os.write(master, choice)
             read_until('选择操作:')
             collect_while_waiting()

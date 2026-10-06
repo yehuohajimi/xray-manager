@@ -14,6 +14,7 @@
 ├── tests/
 │   ├── test_deploy.py           # 安装地址探测、手动覆盖和失败处理测试
 │   ├── test_manager.py          # 交互菜单、并发锁和统计测试
+│   ├── test_update.py           # GitHub 在线更新与稳定版选择测试
 │   └── test_upgrade.py          # 隔离环境中的升级与回滚测试
 ├── .github/workflows/check.yml  # GitHub 自动语法检查和测试
 ├── .gitignore                   # 排除凭据、运行数据和备份
@@ -21,6 +22,8 @@
 ```
 
 仓库中的 `manager.py` 是源码；实际运行的是安装到 `/usr/local/lib/xray-manager/manager.py` 的副本。`git pull` 更新仓库文件，执行 `upgrade-xray.sh` 后才会更新已安装的管理程序；设置 `VERSION` 时还会更新 Xray 内核。
+
+已安装支持在线更新的 manager 后，可以运行 `xray-manager update` 或使用“在线更新”菜单。管理程序从 `yehuohajimi/xray-manager/main` 固定一个提交获取 `manager.py` 和 `upgrade-xray.sh`，在临时目录执行升级；不修改本地 Git 工作目录。内核目标使用 XTLS/Xray-core 官方最新非草稿、非预发布 Release，依然校验 SHA256，并复用原地升级的备份和失败回滚流程。
 
 ## 运行结构
 
@@ -102,6 +105,8 @@ journalctl -u xray-stats.service -n 50 --no-pager
 | `/var/lib/xray-manager/upgrade.lock` | 升级脚本互斥锁，防止同时执行多个升级 |
 
 `manager.lock` 仅在单次操作期间持有。菜单等待输入、确认和返回时已释放锁并关闭数据库连接，后台统计可继续执行。采集与设备修改保持互斥，增删设备的配置读取、校验、保存和重启在同一锁内完成；服务状态和服务日志查询不获取此锁。
+
+升级脚本先持有 `upgrade.lock` 防止并发更新，在程序切换和失败回滚期间持有 `manager.lock`；下载和菜单确认期间不持有管理锁。升级脚本调用采集子命令前释放管理锁，避免子进程等待父进程持有的锁。原先启用的统计定时任务会在成功或失败后恢复。
 
 状态目录 `/var/lib/xray-manager` 权限为 `700`，仅 root 可访问。数据库内部结构：
 

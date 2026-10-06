@@ -29,6 +29,10 @@ ast.parse(pathlib.Path(sys.argv[1]).read_text(), filename=sys.argv[1])
 PY
 runuser -u xray -- "$core" run -test -config "$config"
 
+# Acquire this before installing dependencies or making backup directories.
+exec 9>"$state/upgrade.lock"
+flock -n 9 || { echo 'Another upgrade is running'; exit 1; }
+
 # Existing installs gain terminal QR sharing without replacing proxy identities.
 if ! command -v qrencode >/dev/null; then
     echo 'Installing qrencode for terminal client sharing'
@@ -36,14 +40,12 @@ if ! command -v qrencode >/dev/null; then
     apt-get install -y qrencode
 fi
 
-# Keep concurrent upgrade runs apart. manager.py has its own lock for collection.
-exec 9>"$state/upgrade.lock"
-flock -n 9 || { echo 'Another upgrade is running'; exit 1; }
 work=$(mktemp -d)
 backup=$(mktemp -d "$state/upgrade-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")
 timer_was_active=0
 manager_switched=0
 core_switched=0
+manager_lock_open=0
 success=0
 
 finish() {
@@ -51,6 +53,7 @@ finish() {
     trap - EXIT
     if (( ! success )); then
         echo "Upgrade failed; restoring installed programs from $backup" >&2
+        if (( manager_lock_open )); then flock 8; fi
         if (( manager_switched )); then
             install -m 644 "$backup/manager.py" "$manager.rollback.$$"
             mv -f "$manager.rollback.$$" "$manager"
@@ -61,6 +64,7 @@ finish() {
             systemctl restart xray.service || echo 'Rollback restart failed; inspect xray.service' >&2
         fi
     fi
+    if (( manager_lock_open )); then flock -u 8; fi
     if (( timer_was_active )); then
         if ! systemctl start xray-stats.timer; then
             echo 'Could not restart xray-stats.timer' >&2
@@ -84,8 +88,8 @@ if [[ -n $version ]]; then
         *) echo 'Unsupported architecture'; exit 1 ;;
     esac
     base="https://github.com/XTLS/Xray-core/releases/download/$version/Xray-linux-$arch.zip"
-    curl --fail --location --retry 3 "$base" -o "$work/xray.zip"
-    curl --fail --location --retry 3 "$base.dgst" -o "$work/xray.dgst"
+    curl --fail --location --retry 3 --connect-timeout 10 --max-time 300 "$base" -o "$work/xray.zip"
+    curl --fail --location --retry 3 --connect-timeout 10 --max-time 60 "$base.dgst" -o "$work/xray.dgst"
     python3 - "$work" <<'PY'
 import hashlib, pathlib, re, sys
 p = pathlib.Path(sys.argv[1])
@@ -107,6 +111,14 @@ if systemctl is-active --quiet xray-stats.timer; then
 fi
 # Wait for any in-flight collector via manager.py's lock, then snapshot its DB.
 /usr/local/bin/xray-manager collect
+# Prevent account changes and collection during the program switch. All manager
+# subprocesses run before acquisition or after release to avoid self-deadlock.
+exec 8>"$state/manager.lock"
+manager_lock_open=1
+flock 8
+if [[ -n $version ]]; then
+    runuser -u xray -- "$work/xray" run -test -config "$config"
+fi
 cp -a "$config" "$backup/config.json"
 cp -a "$connection" "$backup/connection.json"
 cp -a "$core" "$backup/xray"
@@ -129,9 +141,14 @@ if [[ -n $version ]]; then
     sleep 2
     systemctl is-active --quiet xray.service
 fi
-/usr/local/bin/xray-manager collect
 cmp -s "$config" "$backup/config.json"
 cmp -s "$connection" "$backup/connection.json"
+flock -u 8
+/usr/local/bin/xray-manager collect
+if (( timer_was_active )); then
+    systemctl start xray-stats.timer
+    timer_was_active=0
+fi
 success=1
 echo "Upgrade complete. Existing config, accounts, connection details, and statistics retained."
 echo "Pre-upgrade backup: $backup"

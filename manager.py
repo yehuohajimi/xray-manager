@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import ast
 import datetime as dt
 from contextlib import contextmanager
 import fcntl
@@ -13,6 +14,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 import uuid
 
@@ -20,6 +22,8 @@ ROOT = pathlib.Path('/var/lib/xray-manager')
 CONFIG = pathlib.Path('/usr/local/etc/xray/config.json')
 XRAY = '/usr/local/bin/xray'
 BACKUP_HOME = pathlib.Path('/root')
+UPDATE_REPO = 'yehuohajimi/xray-manager'
+UPDATE_BRANCH = 'main'
 db = None
 
 
@@ -210,6 +214,8 @@ xray-manager logs                    Last 100 service log entries
 xray-manager backups                 List saved backups and sizes
 xray-manager backup-info PATH        Show backup metadata and file listing
 xray-manager delete-backup PATH --yes  Permanently delete a listed backup
+xray-manager update                  Update manager and latest stable Xray from GitHub
+xray-manager update --manager-only   Update manager without restarting Xray
 uplink=user upload; downlink=user download. User/inbound/outbound are overlapping
 views: do not add them together. Historical bytes are per UUID, not per source IP.
 Abrupt crashes/reboots can lose bytes since the last sample (~1 minute).
@@ -218,6 +224,78 @@ IP history records accepted requests, not exact device online/offline times.''')
 
 def device_names():
     return [user['email'] for user in inbound(config())['settings']['clients']]
+
+
+def fetch_update(url, target=None):
+    args = ['curl', '--fail', '--location', '--silent', '--show-error',
+            '--connect-timeout', '10', '--max-time', '60', '--retry', '2',
+            '--max-filesize', '2097152', '-H', 'Accept: application/vnd.github+json']
+    if target is not None:
+        args.extend(['-o', str(target)])
+    args.append(url)
+    return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT, timeout=210)
+
+
+def update_json(url):
+    try:
+        value = json.loads(fetch_update(url))
+    except json.JSONDecodeError:
+        raise ValueError('GitHub 返回了无效的更新信息，请稍后重试。') from None
+    if not isinstance(value, dict):
+        raise ValueError('GitHub 返回了无效的更新信息。')
+    return value
+
+
+def online_update(manager_only=False, ask_confirmation=False):
+    """Stage one repository commit, then let its upgrade script back up and switch."""
+    print(f'正在获取 GitHub 更新: {UPDATE_REPO} ({UPDATE_BRANCH})', flush=True)
+    commit = update_json(f'https://api.github.com/repos/{UPDATE_REPO}/commits/{UPDATE_BRANCH}')
+    sha = commit.get('sha', '')
+    if not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}', sha):
+        raise ValueError('GitHub 提交标识无效，已取消更新。')
+    version = None
+    current = None
+    if not manager_only:
+        release = update_json('https://api.github.com/repos/XTLS/Xray-core/releases/latest')
+        version = release.get('tag_name', '')
+        if (release.get('draft') is not False or release.get('prerelease') is not False
+                or not isinstance(version, str) or not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', version)):
+            raise ValueError('未取得有效的 Xray 正式稳定版本，已取消更新。')
+        description = run(XRAY, 'version')
+        match = re.search(r'^Xray\s+([0-9]+\.[0-9]+\.[0-9]+)(?=\s|$)', description)
+        current = 'v' + match[1] if match else None
+    print(f'Manager 来源: https://github.com/{UPDATE_REPO}/commit/{sha}')
+    if version:
+        print(f'Xray: {current or "未知版本"} → {version}')
+    else:
+        print('仅更新 manager，Xray 内核保持现有版本。')
+    switch_core = version is not None and version != current
+    if version and not switch_core:
+        print('Xray 已是最新稳定版，仅更新 manager，无需重启 Xray。')
+    if ask_confirmation:
+        impact = '更新内核将重启 Xray，连接会短暂中断。' if switch_core else '本次无需重启 Xray。'
+        if not confirm(impact + '保留设备账号、密钥和统计数据。继续更新？'):
+            print('已取消更新。')
+            return False
+    with tempfile.TemporaryDirectory(prefix='xray-manager-update-') as staging:
+        staging = pathlib.Path(staging)
+        for filename in ('manager.py', 'upgrade-xray.sh'):
+            print(f'正在下载 {filename}…', flush=True)
+            fetch_update(f'https://raw.githubusercontent.com/{UPDATE_REPO}/{sha}/{filename}',
+                         staging / filename)
+        try:
+            ast.parse((staging / 'manager.py').read_text(), filename='downloaded manager.py')
+        except (SyntaxError, UnicodeError):
+            raise ValueError('下载的 manager.py 无法通过语法检查，已取消更新。') from None
+        subprocess.run(['bash', '-n', str(staging / 'upgrade-xray.sh')], check=True)
+        env = os.environ.copy()
+        # Inherited VERSION must not override the version selected from GitHub.
+        env.pop('VERSION', None)
+        if switch_core:
+            env['VERSION'] = version
+        print('代码检查通过，开始备份和更新…', flush=True)
+        subprocess.run(['bash', str(staging / 'upgrade-xray.sh')], env=env, check=True)
+    return True
 
 
 def backup_candidates():
@@ -345,6 +423,7 @@ def execute(args, backup_identity=None, qr=False):
         'start': (0, 0), 'restart': (0, 0), 'stop': (0, 0),
         'status': (0, 0), 'logs': (0, 0),
         'backups': (0, 0), 'backup-info': (1, 1), 'delete-backup': (2, 2),
+        'update': (0, 1),
     }
     if cmd not in arity:
         raise ValueError(f'Unknown command: {cmd}. Use xray-manager help')
@@ -353,6 +432,8 @@ def execute(args, backup_identity=None, qr=False):
         raise ValueError(f'Invalid arguments for {cmd}. Use xray-manager help')
     if cmd == 'delete-backup' and params[1] != '--yes':
         raise ValueError('Usage: xray-manager delete-backup PATH --yes')
+    if cmd == 'update' and params and params[0] != '--manager-only':
+        raise ValueError('Usage: xray-manager update [--manager-only]')
     if cmd in ('add-device', 'remove-device', 'share') and params:
         if not re.fullmatch(r'[A-Za-z0-9_-]{1,40}', params[0]):
             raise ValueError('Device name must contain letters/digits/_/-; 1..40 chars')
@@ -367,6 +448,9 @@ def execute(args, backup_identity=None, qr=False):
     if os.geteuid() != 0:
         raise PermissionError('Run with sudo/root')
     os.umask(0o077)
+    if cmd == 'update':
+        online_update(manager_only=bool(params))
+        return
     if cmd == 'backups':
         list_backups()
         return
@@ -453,6 +537,7 @@ MENU = '''
   3. 日志与统计
   4. 备份管理
   5. 服务控制
+  6. 在线更新
   0. 退出
 '''
 
@@ -488,6 +573,13 @@ SERVICE_MENU = '''
   1. 启动服务
   2. 重启服务
   3. 停止服务
+  0. 返回主菜单
+'''
+
+UPDATE_MENU = '''
+=== Xray Manager / 在线更新 ===
+  1. 更新 manager + Xray 最新稳定版
+  2. 仅更新 manager
   0. 返回主菜单
 '''
 
@@ -564,6 +656,14 @@ def service_action(choice):
         raise ValueError('请输入菜单中的编号。')
 
 
+def update_action(choice):
+    if choice not in ('1', '2'):
+        raise ValueError('请输入菜单中的编号。')
+    if online_update(manager_only=choice == '2', ask_confirmation=True):
+        print('更新完成，正在打开新版管理菜单…', flush=True)
+        os.execv(sys.executable, [sys.executable, str(pathlib.Path(__file__).resolve()), 'menu'])
+
+
 def backup_action(choice):
     if choice == '1':
         execute(['backups'])
@@ -589,7 +689,8 @@ def backup_action(choice):
 
 def menu_action(choice):
     submenus = {'2': (DEVICE_MENU, device_action), '3': (STATS_MENU, stats_action),
-                '4': (BACKUP_MENU, backup_action), '5': (SERVICE_MENU, service_action)}
+                '4': (BACKUP_MENU, backup_action), '5': (SERVICE_MENU, service_action),
+                '6': (UPDATE_MENU, update_action)}
     if choice in submenus:
         interactive_menu(*submenus[choice])
         return True  # Returning from a submenu immediately redraws the main menu.
